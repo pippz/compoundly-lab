@@ -1365,6 +1365,22 @@
         const WIKI_BASE = "https://en.wikipedia.org/api/rest_v1/page/summary";
         const FETCH_TIMEOUT_MS = 12000;
 
+        // Exact, curated Italian-to-English chemical-name mappings.
+        // These are lookup aliases, not translations of chemical data.
+        const ITALIAN_ALIASES = Object.freeze({
+            "glucosio": "glucose",
+            "d-glucosio": "d-glucose",
+            "acido acetilsalicilico": "acetylsalicylic acid",
+            "aspirina": "aspirin",
+            "caffeina": "caffeine",
+            "cloruro di sodio": "sodium chloride",
+            "etanolo": "ethanol",
+            "alcol etilico": "ethanol",
+            "acido citrico": "citric acid",
+            "acido solforico": "sulfuric acid",
+            "perossido di idrogeno": "hydrogen peroxide"
+        });
+
         const searchInput = document.getElementById("searchInput");
         const searchBtn = document.getElementById("searchBtn");
         const statusEl = document.getElementById("status");
@@ -1413,8 +1429,47 @@
         }
         }
 
+        function normalizeSearchQuery(value) {
+        return String(value ?? "")
+            .normalize("NFC")
+            .replace(/[\u2010-\u2015\u2212]/g, "-")
+            .replace(/[\u2018\u2019]/g, "'")
+            .replace(/\s+/g, " ")
+            .trim();
+        }
+
+        // Identifiers and machine-readable chemical notation should never be translated.
+        function shouldSkipTranslation(value) {
+        const query = normalizeSearchQuery(value);
+        if (!query) return true;
+        if (/^\d+(?:[.,]\d+)?$/.test(query)) return true; // CID or numeric molecular weight
+        if (/^\d{2,7}-\d{2}-\d$/.test(query)) return true; // CAS Registry Number
+        if (/^InChI=/i.test(query)) return true;
+        if (/^[A-Z]{14}-[A-Z]{10}-[A-Z]$/i.test(query)) return true; // InChIKey
+        if (/^(?:[A-Z][a-z]?\d*)+$/.test(query)) return true; // molecular formula
+        if (/[\[\]{}()=#/@\\]/.test(query) || /\b(?:SMILES|InChIKey|InChI)\b/i.test(query)) return true; // likely SMILES / notation
+        return false;
+        }
+
+        async function translateItalianToEnglish(query) {
+        if (shouldSkipTranslation(query)) return null;
+        const res = await fetchWithTimeout("/api/translate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text: normalizeSearchQuery(query) })
+        });
+        if (!res.ok) {
+            const detail = await res.text().catch(() => "");
+            throw new Error(`Translation service unavailable (${res.status})${detail ? `: ${detail.slice(0, 120)}` : ""}`);
+        }
+        const data = await res.json();
+        const translated = normalizeSearchQuery(data?.translatedText || "");
+        if (!translated || translated.toLowerCase() === normalizeSearchQuery(query).toLowerCase()) return null;
+        return translated;
+        }
+
         function triggerSearch() {
-        const name = searchInput.value.trim();
+        const name = normalizeSearchQuery(searchInput.value);
         if (!name) {
             setStatus("Enter a compound name or identifier to begin.", "error");
             searchInput.focus();
@@ -1485,6 +1540,7 @@
         }
 
         async function runSearch(name) {
+        name = normalizeSearchQuery(name);
         const requestId = ++currentRequestId;
         const cacheKey = name.toLowerCase();
         hidePicker();
@@ -1533,6 +1589,67 @@
                 await showPicker(cids, requestId, cacheKey);
             }
             return;
+            }
+
+            // If the original name misses, try a known Italian alias before
+            // invoking external fallback resolvers. Keep the original query
+            // for cache identity and user-facing context.
+            const normalizedName = normalizeSearchQuery(name).toLowerCase();
+            const englishAlias = ITALIAN_ALIASES[normalizedName];
+            if (englishAlias) {
+                setStatus(`No direct match. Trying the known English name “${englishAlias}”…`);
+                try {
+                    cids = await pubchemNameToCids(englishAlias);
+                } catch (e) {
+                    console.warn("PubChem alias lookup errored; continuing to fallback:", e);
+                    cids = null;
+                }
+
+                if (requestId !== currentRequestId) return;
+
+                if (cids && cids.length > 0) {
+                    if (cids.length === 1) {
+                        setStatus("Compound identified. Retrieving molecular properties…");
+                        updatePipeline("stepProperties", "Retrieving molecular properties…");
+                        await loadCompoundByCid(cids[0], name, requestId, cacheKey);
+                    } else {
+                        setStatus(`Found ${cids.length} possible matches. Loading candidate records…`);
+                        updatePipeline("stepProperties", "Loading candidate records…");
+                        await showPicker(cids, requestId, cacheKey);
+                    }
+                    return;
+                }
+            }
+
+            // DeepL is a later-stage resolver: only translate after direct PubChem
+            // and the curated alias dictionary have failed. The API key stays server-side.
+            if (!shouldSkipTranslation(name)) {
+                setStatus("No direct match. Trying an Italian-to-English translation…");
+                updatePipeline("stepResolve", "Translating the search term…");
+                try {
+                    const translatedName = await translateItalianToEnglish(name);
+                    if (requestId !== currentRequestId) return;
+                    if (translatedName) {
+                        setStatus(`Trying the translated name “${translatedName}”…`);
+                        cids = await pubchemNameToCids(translatedName);
+                        if (requestId !== currentRequestId) return;
+                        if (cids && cids.length > 0) {
+                            if (cids.length === 1) {
+                                setStatus("Compound identified. Retrieving molecular properties…");
+                                updatePipeline("stepProperties", "Retrieving molecular properties…");
+                                await loadCompoundByCid(cids[0], name, requestId, cacheKey);
+                            } else {
+                                setStatus(`Found ${cids.length} possible matches. Loading candidate records…`);
+                                updatePipeline("stepProperties", "Loading candidate records…");
+                                await showPicker(cids, requestId, cacheKey);
+                            }
+                            return;
+                        }
+                    }
+                } catch (e) {
+                    // Translation is an optional resolver; continue to Cactus/Wikipedia if it fails.
+                    console.warn("Italian-to-English translation failed; continuing to fallback:", e);
+                }
             }
 
             setStatus(pubchemFailed ? "PubChem lookup had trouble. Trying the alternate resolver…" : "No direct PubChem match. Trying the alternate resolver…");
