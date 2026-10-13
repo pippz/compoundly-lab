@@ -31,14 +31,16 @@ module.exports = async function handler(req, res) {
 
   try {
     const form = new URLSearchParams({
-      auth_key: process.env.DEEPL_API_KEY,
       text,
       source_lang: "IT",
       target_lang: "EN-US"
     });
     const upstream = await fetch(baseUrl, {
       method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      headers: {
+        "Authorization": `DeepL-Auth-Key ${process.env.DEEPL_API_KEY}`,
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
       body: form.toString()
     });
 
